@@ -1,7 +1,7 @@
-# Simple File Downloader (v8.6)
+# Simple File Downloader (v8.7)
 #
-# - Fixed error logging to use repr(e) for detailed, non-empty error reasons.
-# - Error messages now show the clean local path instead of the long URL.
+# - Added graceful shutdown on Ctrl+C (KeyboardInterrupt).
+# - When interrupted, the script will stop finding new files and finish any in-progress downloads before exiting.
 #
 # To install dependencies:
 # pip install aiohttp asyncio aiofiles beautifulsoup4 tqdm colorama lxml
@@ -27,11 +27,13 @@ from tqdm.contrib.logging import _TqdmLoggingHandler as TqdmLoggingHandler
 @dataclass
 class DownloaderConfig:
     """Configuration settings for the downloader."""
-    url: str = "https://elhacker.info/Cursos/Cybrary%20-%20Become%20a%20SOC%20Analyst%20-%20Level%201%20Path/"
+    url: str = "https://elhacker.info/Cursos/Cybrary%20-%20Become%20a%20SOC%20Analyst%20-%20Level%203%20Path/"
     file_extensions: List[str] = field(default_factory=lambda: [".txt", ".md", ".mp4", ".srt", ".rar", ".zip", ".pdf", ".webm"])
     base_download_folder: str = "downloads"
-    max_concurrent_downloads: int = 8
-    request_timeout: int = 60
+    
+    max_concurrent_downloads: int = 4
+    request_timeout: int = 180
+    
     chunk_size: int = 8192
     max_retries: int = 3
     retry_delay: float = 1.0
@@ -92,7 +94,10 @@ class SimpleFileDownloader:
         self.start_url = config.url if config.url.endswith('/') else f"{config.url}/"
         self.project_folder = self._create_project_folder()
         self.session: Optional[aiohttp.ClientSession] = None
-        
+        # --- NEW: Event to signal graceful shutdown ---
+        self.shutdown_event = asyncio.Event()
+        self._worker_tasks: List[asyncio.Task] = []
+
     def _create_project_folder(self) -> Path:
         try:
             parsed_url = urlparse(self.start_url)
@@ -134,6 +139,10 @@ class SimpleFileDownloader:
         return None
 
     async def _discover_recursively(self, directory_url: str, current_depth: int, found_files: List[FileInfo], visited_urls: Set[str]):
+        # --- NEW: Stop discovery if shutdown is requested ---
+        if self.shutdown_event.is_set():
+            return
+            
         if current_depth > self.config.max_depth or directory_url in visited_urls: return
         visited_urls.add(directory_url)
         self.logger.info(f"Scanning [Depth {current_depth}]: {unquote(directory_url)}")
@@ -143,6 +152,10 @@ class SimpleFileDownloader:
             soup = BeautifulSoup(html, 'lxml')
             sub_tasks = []
             for link in soup.find_all('a', href=True):
+                # --- NEW: Check event in loop to exit faster ---
+                if self.shutdown_event.is_set():
+                    break
+                
                 href, link_text = link['href'], link.get_text(strip=True).lower()
                 if any(p in link_text for p in ['parent directory', '..']) or href.startswith('?') or href.strip() in ('../', '..', './'): continue
                 absolute_url = urljoin(directory_url, href)
@@ -156,7 +169,9 @@ class SimpleFileDownloader:
                 elif is_directory_url(absolute_url, self.config.file_extensions) and absolute_url not in visited_urls:
                     task = asyncio.create_task(self._discover_recursively(absolute_url, current_depth + 1, found_files, visited_urls))
                     sub_tasks.append(task)
-            if sub_tasks: await asyncio.gather(*sub_tasks)
+            
+            if sub_tasks and not self.shutdown_event.is_set():
+                await asyncio.gather(*sub_tasks)
         except Exception as e: self.logger.error(f"Failed to parse or process {directory_url}: {e}")
 
     async def get_file_size(self, url: str) -> Optional[int]:
@@ -186,7 +201,6 @@ class SimpleFileDownloader:
                         pbar.update(len(chunk))
                 return True
         except Exception as e:
-            # --- FIX: Using local_path and repr(e) for a much better error message ---
             self.logger.error(f"Failed to save to {file_info.local_path}. Reason: {repr(e)}")
             pbar.set_description(f"Failed: {file_info.local_path.name[:35]:<35}")
             if file_info.local_path.exists():
@@ -195,39 +209,54 @@ class SimpleFileDownloader:
             return False
 
     async def download_all_files(self, all_files: List[FileInfo]):
+        if self.shutdown_event.is_set(): return
         if not all_files: self.logger.warning("No files to download"); return
+        
         self.logger.info(f"Checking {len(all_files)} files against local copies...")
         files_to_download = [f for f in all_files if not await self.should_skip_download(f)]
         if not files_to_download: self.logger.info("All files are already up to date."); return
+        
         self.logger.info(f"Downloading {len(files_to_download)} new/updated files")
         successful_downloads = 0
         with tqdm(total=len(files_to_download), unit="file", desc="Overall Progress", position=0) as overall_pbar:
             async def worker(queue: asyncio.Queue, worker_id: int):
                 nonlocal successful_downloads
-                while not queue.empty():
+                # --- NEW: Loop condition checks for shutdown signal ---
+                while not self.shutdown_event.is_set():
                     try:
-                        file_info = await queue.get()
+                        # --- NEW: Use timeout to unblock periodically and re-check shutdown event ---
+                        file_info = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        # If queue is empty, other workers might still be processing.
+                        # We rely on queue.join() to signal when all work is truly done.
+                        continue
+                    except asyncio.CancelledError:
+                        break # Exit if the worker task itself is cancelled.
+
+                    try: # Wrap download to ensure task_done is always called
                         file_name = file_info.local_path.name
                         with tqdm(total=0, unit='B', unit_scale=True, unit_divisor=1024,
                                   desc=f"{file_name[:35]:<35}", position=worker_id + 1, leave=False) as pbar:
                             success = await self.download_file(file_info, pbar)
                             if success:
                                 successful_downloads += 1
+                    finally:
                         overall_pbar.update(1)
                         queue.task_done()
-                    except asyncio.CancelledError:
-                        break
+
             download_queue = asyncio.Queue()
             for f in files_to_download:
                 await download_queue.put(f)
-            workers = [
+
+            # --- NEW: Store worker tasks to manage them during shutdown ---
+            self._worker_tasks = [
                 asyncio.create_task(worker(download_queue, i))
                 for i in range(self.config.max_concurrent_downloads)
             ]
+
+            # Wait for the queue to be fully processed. This can be interrupted.
             await download_queue.join()
-            for w in workers:
-                w.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
+
         self.logger.info(f"Download complete: {successful_downloads}/{len(files_to_download)} files successful")
     
     async def run(self):
@@ -236,13 +265,32 @@ class SimpleFileDownloader:
             self.logger.info(f"Starting recursive discovery (max depth: {self.config.max_depth})...")
             all_files, visited_urls = [], set()
             await self._discover_recursively(self.start_url, 0, all_files, visited_urls)
+            
+            if self.shutdown_event.is_set():
+                self.logger.warning("Discovery was interrupted by user.")
+                return
+
             unique_files = {str(f.local_path): f for f in all_files}
             unique_files_list = list(unique_files.values())
             self.logger.info(f"Total unique files found: {len(unique_files_list)}")
             await self.download_all_files(unique_files_list)
-        except KeyboardInterrupt: self.logger.warning("Process interrupted by user")
-        except Exception as e: self.logger.critical(f"A critical error occurred: {e}", exc_info=True)
+        
+        # --- NEW: Centralized exception handling for graceful shutdown ---
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            self.logger.warning("\nProcess interrupted by user. Finishing current downloads...")
+            self.shutdown_event.set() # Signal all coroutines to stop gracefully
+        
+        except Exception as e:
+            self.logger.critical(f"A critical error occurred: {e}", exc_info=True)
+            self.shutdown_event.set() # Also trigger shutdown on other critical errors
+
         finally:
+            # --- NEW: Wait for any running downloads to complete before exiting ---
+            if self._worker_tasks:
+                self.logger.info("Waiting for active downloads to complete...")
+                await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+                self.logger.info("All running downloads have been closed.")
+            
             execution_time = time.time() - start_time
             self.logger.info(f"\nTotal execution time: {execution_time:.2f} seconds")
             self.logger.info(f"Downloads saved to: {self.project_folder.absolute()}")
@@ -250,12 +298,17 @@ class SimpleFileDownloader:
 # --- MAIN EXECUTION ---
 async def main():
     config = DownloaderConfig()
-    async with SimpleFileDownloader(config) as downloader: await downloader.run()
+    async with SimpleFileDownloader(config) as downloader:
+        await downloader.run()
 
 if __name__ == "__main__":
     if os.name == 'nt': asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    try: asyncio.run(main())
-    except KeyboardInterrupt: print("\nDownloader stopped by user.")
+    try:
+        # asyncio.run handles KeyboardInterrupt by raising CancelledError in the task
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # This message will appear if Ctrl+C is pressed before the event loop starts
+        print("\nDownloader stopped by user.")
     except Exception as e:
         print(f"\nAn unexpected error occurred in the main execution block: {e}")
         import traceback; traceback.print_exc()
