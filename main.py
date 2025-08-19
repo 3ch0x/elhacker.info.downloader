@@ -31,7 +31,7 @@ class DownloaderConfig:
     file_extensions: List[str] = field(default_factory=lambda: [".txt", ".md", ".mp4", ".srt", ".rar", ".zip", ".pdf", ".webm"])
     base_download_folder: str = "downloads"
     
-    max_concurrent_downloads: int = 4
+    max_concurrent_downloads: int = 10
     request_timeout: int = 180000
     
     chunk_size: int = 8192
