@@ -32,7 +32,7 @@ class DownloaderConfig:
     base_download_folder: str = "downloads"
     
     max_concurrent_downloads: int = 4
-    request_timeout: int = 180
+    request_timeout: int = 180000
     
     chunk_size: int = 8192
     max_retries: int = 3
